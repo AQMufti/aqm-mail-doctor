@@ -3,7 +3,7 @@
  * Plugin Name: AQM Mail Doctor
  * Plugin URI:  https://github.com/AQMufti/aqm-mail-doctor
  * Description: Normalises outgoing mail to the aqmuftirealty.com standard, and records what the mail server ACTUALLY said when a message is refused. Adds a Mail screen under the AQM menu with a send test.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      A. Q. Mufti
  * License:     GPL-2.0-or-later
  *
@@ -61,7 +61,7 @@
 defined( 'ABSPATH' ) || exit;
 
 define( 'AQM_MD_FILE', __FILE__ );
-define( 'AQM_MD_VERSION', '1.0.0' );
+define( 'AQM_MD_VERSION', '1.1.0' );
 define( 'AQM_MD_GITHUB_REPO', 'AQMufti/aqm-mail-doctor' );
 
 require_once __DIR__ . '/aqm-updater.php';
@@ -252,7 +252,251 @@ function aqm_md_note( $kind, $detail, $subject = '' ) {
 }
 
 /* =====================================================================
- * 3. The screen
+ * 3. The cure: fix the Elementor forms themselves
+ *
+ * Added 1.1.0, once a test send to info@aqmuftirealty.com was confirmed
+ * delivered end to end - which proved the transport was healthy and the
+ * cross-domain recipient was the whole fault.
+ *
+ * Scope is deliberately narrow. Only Elementor FORM SETTINGS keys are touched -
+ * email_to, email_from, email_reply_to, email_cc, email_bcc and their numbered
+ * variants for a second email action. Page copy that displays info@aqmufti.com
+ * as visible text is counted and reported but NEVER rewritten: changing what a
+ * page says to a visitor is a content decision, not a mail fix.
+ *
+ * Revisions are excluded. Elementor writes _elementor_data on every revision,
+ * so the raw count of matching meta rows is much larger than the number of real
+ * pages, and rewriting revisions would achieve nothing.
+ *
+ * Every post gets its original _elementor_data copied to _aqm_md_backup before
+ * the first write, once, so the whole pass is reversible.
+ * ================================================================== */
+
+/** Form setting keys whose value is an address we may rewrite. */
+function aqm_md_email_keys_pattern() {
+	return '/^email(_to|_from|_reply_to|_cc|_bcc)?(_\d+)?$/i';
+}
+
+/**
+ * Walk a decoded Elementor tree, rewriting addresses in form settings only.
+ *
+ * @param mixed $node    Decoded JSON, by reference.
+ * @param array $changes Collected "key: old -> new" strings, by reference.
+ */
+function aqm_md_walk( &$node, array &$changes ) {
+
+	if ( ! is_array( $node ) ) {
+		return;
+	}
+
+	foreach ( $node as $key => &$value ) {
+
+		if ( is_string( $value )
+			&& is_string( $key )
+			&& preg_match( aqm_md_email_keys_pattern(), $key )
+			&& false !== stripos( $value, '@' . AQM_MD_FROM_DOMAIN )
+		) {
+			$parts = array_map( 'aqm_md_fix_address', explode( ',', $value ) );
+			$new   = implode( ', ', $parts );
+			if ( $new !== $value ) {
+				$changes[] = $key . ': ' . $value . ' -> ' . $new;
+				$value     = $new;
+			}
+			continue;
+		}
+
+		if ( is_array( $value ) ) {
+			aqm_md_walk( $value, $changes );
+		}
+	}
+	unset( $value );
+}
+
+/**
+ * Every non-revision post whose Elementor data mentions the old domain.
+ *
+ * @return array<int,array> id => row
+ */
+function aqm_md_scan( $apply = false ) {
+
+	global $wpdb;
+
+	$needle = '%' . $wpdb->esc_like( '@' . AQM_MD_FROM_DOMAIN ) . '%';
+
+	$rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT p.ID, p.post_title, p.post_type, p.post_status
+			   FROM {$wpdb->postmeta} m
+			   JOIN {$wpdb->posts} p ON p.ID = m.post_id
+			  WHERE m.meta_key = '_elementor_data'
+			    AND m.meta_value LIKE %s
+			    AND p.post_type <> 'revision'
+			  ORDER BY p.post_type, p.post_title",
+			$needle
+		),
+		ARRAY_A
+	);
+
+	$out = array();
+
+	foreach ( (array) $rows as $row ) {
+
+		$id  = (int) $row['ID'];
+		$raw = get_post_meta( $id, '_elementor_data', true );
+
+		if ( is_string( $raw ) ) {
+			$data = json_decode( $raw, true );
+		} else {
+			$data = $raw;   // Elementor sometimes hands back an array already
+		}
+
+		if ( null === $data || ! is_array( $data ) ) {
+			$out[ $id ] = array(
+				'id'     => $id,
+				'title'  => $row['post_title'],
+				'type'   => $row['post_type'],
+				'status' => $row['post_status'],
+				'error'  => 'could not decode _elementor_data - skipped',
+			);
+			continue;
+		}
+
+		$changes = array();
+		aqm_md_walk( $data, $changes );
+
+		// Mentions that are page copy, not form settings. Counted, never touched.
+		$copy_mentions = substr_count( strtolower( (string) $raw ), '@' . AQM_MD_FROM_DOMAIN ) - count( $changes );
+
+		$entry = array(
+			'id'            => $id,
+			'title'         => $row['post_title'],
+			'type'          => $row['post_type'],
+			'status'        => $row['post_status'],
+			'form_changes'  => $changes,
+			'copy_mentions' => max( 0, $copy_mentions ),
+			'applied'       => false,
+		);
+
+		if ( $apply && $changes ) {
+
+			// Back up once, and only once, so a second run cannot overwrite the
+			// pristine original with an already-modified copy.
+			if ( '' === (string) get_post_meta( $id, '_aqm_md_backup', true ) ) {
+				update_post_meta( $id, '_aqm_md_backup', wp_slash( (string) $raw ) );
+				update_post_meta( $id, '_aqm_md_backup_at', current_time( 'mysql' ) );
+			}
+
+			$json = wp_json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+
+			if ( ! is_string( $json ) || '' === $json ) {
+				$entry['error'] = 're-encoding failed - nothing written';
+			} else {
+				update_post_meta( $id, '_elementor_data', wp_slash( $json ) );
+
+				// Elementor caches rendered CSS per post id; both are regenerated.
+				delete_post_meta( $id, '_elementor_css' );
+				delete_post_meta( $id, '_elementor_element_cache' );
+
+				$entry['applied'] = true;
+			}
+		}
+
+		$out[ $id ] = $entry;
+	}
+
+	return $out;
+}
+
+/** Put back the pre-change _elementor_data for one post. */
+function aqm_md_restore( $id ) {
+	$id     = (int) $id;
+	$backup = get_post_meta( $id, '_aqm_md_backup', true );
+	if ( '' === (string) $backup ) {
+		return false;
+	}
+	update_post_meta( $id, '_elementor_data', wp_slash( (string) $backup ) );
+	delete_post_meta( $id, '_elementor_css' );
+	delete_post_meta( $id, '_elementor_element_cache' );
+	return true;
+}
+
+/*
+ * REST. One namespace per plugin - see claude/aqm-rest-namespace-standard.md.
+ * No aqm/v1 alias: this plugin is new and has no callers to keep working.
+ */
+add_action(
+	'rest_api_init',
+	function () {
+
+		register_rest_route(
+			'aqm-maildoctor/v1',
+			'/form-recipients',
+			array(
+				'methods'             => 'GET',
+				'permission_callback' => function () {
+					return current_user_can( 'edit_pages' );
+				},
+				'callback'            => function () {
+					$scan = aqm_md_scan( false );
+					return array(
+						'from_domain' => AQM_MD_FROM_DOMAIN,
+						'to_domain'   => AQM_MD_TO_DOMAIN,
+						'posts'       => array_values( $scan ),
+						'to_change'   => count( array_filter( $scan, function ( $r ) { return ! empty( $r['form_changes'] ); } ) ),
+					);
+				},
+			)
+		);
+
+		register_rest_route(
+			'aqm-maildoctor/v1',
+			'/form-recipients',
+			array(
+				'methods'             => 'POST',
+				'permission_callback' => function () {
+					return current_user_can( 'manage_options' );
+				},
+				'args'                => array(
+					'apply' => array( 'type' => 'boolean', 'default' => false ),
+				),
+				'callback'            => function ( $request ) {
+					$apply = (bool) $request->get_param( 'apply' );
+					$scan  = aqm_md_scan( $apply );
+					return array(
+						'applied'   => $apply,
+						'posts'     => array_values( $scan ),
+						'changed'   => count( array_filter( $scan, function ( $r ) { return ! empty( $r['applied'] ); } ) ),
+						'to_change' => count( array_filter( $scan, function ( $r ) { return ! empty( $r['form_changes'] ); } ) ),
+					);
+				},
+			)
+		);
+
+		register_rest_route(
+			'aqm-maildoctor/v1',
+			'/form-recipients/restore',
+			array(
+				'methods'             => 'POST',
+				'permission_callback' => function () {
+					return current_user_can( 'manage_options' );
+				},
+				'callback'            => function ( $request ) {
+					$ids  = (array) $request->get_param( 'ids' );
+					$done = array();
+					foreach ( $ids as $id ) {
+						if ( aqm_md_restore( $id ) ) {
+							$done[] = (int) $id;
+						}
+					}
+					return array( 'restored' => $done );
+				},
+			)
+		);
+	}
+);
+
+/* =====================================================================
+ * 4. The screen
  * ================================================================== */
 
 add_action(
@@ -325,6 +569,56 @@ function aqm_md_screen() {
 		esc_html( AQM_MD_FROM_DOMAIN ),
 		esc_html( AQM_MD_TO_DOMAIN )
 	);
+
+	/* --- Elementor forms still on the old domain ------------------- */
+
+	$scan      = aqm_md_scan( false );
+	$to_change = array_filter( $scan, function ( $r ) { return ! empty( $r['form_changes'] ); } );
+	$copy_only = array_filter( $scan, function ( $r ) { return empty( $r['form_changes'] ) && ! empty( $r['copy_mentions'] ); } );
+
+	echo '<h2 style="margin-top:2em">Elementor forms</h2>';
+
+	if ( ! $to_change ) {
+		printf(
+			'<p style="color:#00733c"><strong>No form is addressed to %s.</strong> '
+			. 'Once you are satisfied nothing else needs it, the rewrite bridge above can be removed.</p>',
+			esc_html( AQM_MD_FROM_DOMAIN )
+		);
+	} else {
+		printf(
+			'<p><strong>%d page%s still send form mail to %s.</strong> '
+			. 'Fix them with the script rather than by hand &mdash; see below the table.</p>',
+			count( $to_change ),
+			1 === count( $to_change ) ? '' : 's',
+			esc_html( AQM_MD_FROM_DOMAIN )
+		);
+		echo '<table class="widefat striped" style="max-width:1100px"><thead><tr>'
+			. '<th>Page</th><th>Type</th><th>Status</th><th>Settings to change</th></tr></thead><tbody>';
+		foreach ( $to_change as $r ) {
+			printf(
+				'<tr><td><a href="%s"><strong>%s</strong></a> <span style="color:#8c8f94">#%d</span></td>'
+				. '<td>%s</td><td>%s</td><td><code>%s</code></td></tr>',
+				esc_url( get_edit_post_link( $r['id'] ) ),
+				esc_html( $r['title'] ? $r['title'] : '(no title)' ),
+				(int) $r['id'],
+				esc_html( $r['type'] ),
+				esc_html( $r['status'] ),
+				esc_html( implode( '  |  ', $r['form_changes'] ) )
+			);
+		}
+		echo '</tbody></table>';
+	}
+
+	if ( $copy_only ) {
+		printf(
+			'<p style="color:#50575e">%d further page%s mention%s <code>%s</code> in visible page copy. '
+			. 'That is content, not mail configuration, so nothing here touches it &mdash; change it in Elementor if you want to.</p>',
+			count( $copy_only ),
+			1 === count( $copy_only ) ? '' : 's',
+			1 === count( $copy_only ) ? 's' : '',
+			esc_html( AQM_MD_FROM_DOMAIN )
+		);
+	}
 
 	echo '<h2 style="margin-top:2em">Log</h2>';
 
