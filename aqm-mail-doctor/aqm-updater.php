@@ -63,6 +63,62 @@ if ( ! class_exists( 'AQM_Updater' ) ) {
 			add_action( 'upgrader_process_complete', array( $this, 'clear_cache' ), 10, 0 );
 		}
 
+		/**
+		 * Remember why a check failed, and do NOT sulk for an hour over it.
+		 *
+		 * The old code cached an empty result for HOUR_IN_SECONDS on any failure,
+		 * so one rate-limited request blocked checks for the next sixty minutes.
+		 * Five minutes is long enough to stop hammering and short enough that
+		 * pressing the button again is useful.
+		 */
+		private function fail( $why ) {
+			update_option( $this->transient . '_err', $why, false );
+			set_transient( $this->transient, array(), 5 * MINUTE_IN_SECONDS );
+		}
+
+
+		/**
+		 * Read the newest release tag from the public releases feed.
+		 *
+		 * github.com/<owner>/<repo>/releases.atom needs no authentication and is
+		 * not counted against the API rate limit. Each entry links to
+		 * .../releases/tag/<tag>, newest first, so the first match is the latest
+		 * release. Pre-releases appear here too - we have never published one,
+		 * and if that changes this needs revisiting.
+		 */
+		private function release_from_atom() {
+
+			$response = wp_remote_get(
+				'https://github.com/' . $this->repo . '/releases.atom',
+				array(
+					'timeout' => 10,
+					'headers' => array( 'User-Agent' => $this->slug . '/' . $this->version ),
+				)
+			);
+
+			if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+				return null;
+			}
+
+			$body = (string) wp_remote_retrieve_body( $response );
+
+			if ( ! preg_match( '#/releases/tag/([^"\'<>\s]+)#', $body, $m ) ) {
+				return null;
+			}
+
+			$tag = html_entity_decode( $m[1], ENT_QUOTES, 'UTF-8' );
+
+			return array(
+				'version'   => ltrim( $tag, 'vV' ),
+				// release.ps1 always attaches the asset as <slug>.zip, so this
+				// url is deterministic. Verified working while the API was 403.
+				'package'   => 'https://github.com/' . $this->repo . '/releases/download/' . $tag . '/' . $this->slug . '.zip',
+				'url'       => 'https://github.com/' . $this->repo . '/releases/tag/' . $tag,
+				'changelog' => 'Read the release notes on GitHub - the API was rate limited, so this came from the releases feed.',
+				'published' => '',
+			);
+		}
+
 		/** Read the latest GitHub release, cached for 12 hours. */
 		private function release( $force = false ) {
 			if ( ! $force ) {
@@ -72,27 +128,94 @@ if ( ! class_exists( 'AQM_Updater' ) ) {
 				}
 			}
 
-			$response = wp_remote_get(
-				'https://api.github.com/repos/' . $this->repo . '/releases/latest',
-				array(
-					'timeout' => 10,
-					'headers' => array(
-						'Accept'     => 'application/vnd.github+json',
-						'User-Agent' => $this->slug . '/' . $this->version,
-					),
-				)
+			$headers = array(
+				'Accept'     => 'application/vnd.github+json',
+				'User-Agent' => $this->slug . '/' . $this->version,
 			);
 
-			if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
-				set_transient( $this->transient, array(), HOUR_IN_SECONDS );
+			/*
+			 * Unauthenticated GitHub API calls are limited to 60 per hour PER IP,
+			 * and that IP is shared with every other site on this host. Thirteen
+			 * AQM plugins each polling their own repo can exhaust it on their own.
+			 * Define AQM_GITHUB_TOKEN in wp-config.php - a fine-grained token with
+			 * NO scopes is enough for public repos - and the ceiling becomes 5000.
+			 */
+			if ( defined( 'AQM_GITHUB_TOKEN' ) && AQM_GITHUB_TOKEN ) {
+				$headers['Authorization'] = 'Bearer ' . AQM_GITHUB_TOKEN;
+			}
+
+			$response = wp_remote_get(
+				'https://api.github.com/repos/' . $this->repo . '/releases/latest',
+				array( 'timeout' => 10, 'headers' => $headers )
+			);
+
+			/*
+			 * Record WHY a check failed. Until 8 Sep 2026 every failure produced
+			 * the same "could not reach GitHub" line, which is a symptom, not a
+			 * cause - a 404, a rate-limit 403 and a DNS failure all looked
+			 * identical. Keep the real answer and show it.
+			 */
+			if ( is_wp_error( $response ) ) {
+				$this->fail( 'network error: ' . $response->get_error_message() );
+				return null;
+			}
+
+			$code      = (int) wp_remote_retrieve_response_code( $response );
+			$remaining = wp_remote_retrieve_header( $response, 'x-ratelimit-remaining' );
+			$reset     = wp_remote_retrieve_header( $response, 'x-ratelimit-reset' );
+
+			/*
+			 * RATE LIMITED? USE THE ATOM FEED INSTEAD.
+			 *
+			 * Proved on aqmuftirealty.com, 8 Sep 2026: api.github.com returned
+			 * 403 with x-ratelimit-remaining: 0 ("rate limit exceeded for
+			 * 46.202.182.101") while github.com itself answered 200 in half a
+			 * second. The 60/hour cap is per IP and shared with every other site
+			 * on this host, and thirteen AQM plugins can exhaust it alone.
+			 *
+			 * github.com/<repo>/releases.atom is NOT the API and is not subject
+			 * to that cap. It carries the newest release tag, which is all this
+			 * updater actually needs - the download url is predictable because
+			 * release.ps1 always names the asset <slug>.zip.
+			 *
+			 * So the API is preferred (richer data, real changelog) and the feed
+			 * is the fallback. The practical effect is that updates keep working
+			 * with no token, no wp-config edit and no secret to look after.
+			 */
+			if ( in_array( $code, array( 403, 429 ), true ) ) {
+				$feed = $this->release_from_atom();
+				if ( $feed ) {
+					set_transient( $this->transient, $feed, 12 * HOUR_IN_SECONDS );
+					delete_option( $this->transient . '_err' );
+					return $feed;
+				}
+			}
+
+			if ( 200 !== $code ) {
+				$why = 'HTTP ' . $code;
+				if ( 403 === $code || 429 === $code ) {
+					$why .= ' - GitHub API rate limit';
+					if ( '' !== (string) $remaining ) {
+						$why .= ', ' . (int) $remaining . ' requests left';
+					}
+					if ( $reset ) {
+						$why .= ', resets ' . gmdate( 'H:i', (int) $reset ) . ' UTC';
+					}
+					$why .= '. The releases-feed fallback also failed, which is unusual - github.com was reachable when this was last tested.';
+				} elseif ( 404 === $code ) {
+					$why .= ' - no release found, or the repository is private. The updater reads GitHub anonymously, so the repo must be public.';
+				}
+				$this->fail( $why );
 				return null;
 			}
 
 			$body = json_decode( wp_remote_retrieve_body( $response ), true );
 			if ( ! is_array( $body ) || empty( $body['tag_name'] ) ) {
-				set_transient( $this->transient, array(), HOUR_IN_SECONDS );
+				$this->fail( 'GitHub replied 200 but the response had no tag_name.' );
 				return null;
 			}
+
+			delete_option( $this->transient . '_err' );
 
 			// Prefer an attached .zip. GitHub's automatic zipball names its top
 			// folder after the commit, which installs a duplicate rather than
@@ -219,6 +342,7 @@ if ( ! class_exists( 'AQM_Updater' ) ) {
 						'aqm_upd'      => $status,
 						'aqm_upd_name' => rawurlencode( $this->name ),
 						'aqm_upd_ver'  => $release ? rawurlencode( $release['version'] ) : '',
+						'aqm_upd_why'  => $release ? '' : rawurlencode( (string) get_option( $this->transient . '_err', '' ) ),
 					),
 					admin_url( 'plugins.php' )
 				)
@@ -250,7 +374,8 @@ if ( ! class_exists( 'AQM_Updater' ) ) {
 				$text  = sprintf( '%s is up to date (version %s).', $name, $ver );
 			} else {
 				$class = 'notice-error';
-				$text  = sprintf( '%s: could not reach GitHub to check for updates.', $name );
+				$why   = isset( $_GET['aqm_upd_why'] ) ? sanitize_text_field( wp_unslash( $_GET['aqm_upd_why'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+				$text  = sprintf( '%s: the update check failed. %s', $name, $why ? $why : 'No reason was recorded.' );
 			}
 			printf( '<div class="notice %s is-dismissible"><p>%s</p></div>', esc_attr( $class ), esc_html( $text ) );
 		}

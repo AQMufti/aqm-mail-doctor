@@ -3,7 +3,7 @@
  * Plugin Name: AQM Mail Doctor
  * Plugin URI:  https://github.com/AQMufti/aqm-mail-doctor
  * Description: Normalises outgoing mail to the aqmuftirealty.com standard, and records what the mail server ACTUALLY said when a message is refused. Adds a Mail screen under the AQM menu with a send test.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      A. Q. Mufti
  * License:     GPL-2.0-or-later
  *
@@ -61,7 +61,7 @@
 defined( 'ABSPATH' ) || exit;
 
 define( 'AQM_MD_FILE', __FILE__ );
-define( 'AQM_MD_VERSION', '1.2.0' );
+define( 'AQM_MD_VERSION', '1.3.0' );
 define( 'AQM_MD_GITHUB_REPO', 'AQMufti/aqm-mail-doctor' );
 
 require_once __DIR__ . '/aqm-updater.php';
