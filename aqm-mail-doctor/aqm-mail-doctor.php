@@ -3,7 +3,7 @@
  * Plugin Name: AQM Mail Doctor
  * Plugin URI:  https://github.com/AQMufti/aqm-mail-doctor
  * Description: Normalises outgoing mail to the aqmuftirealty.com standard, and records what the mail server ACTUALLY said when a message is refused. Adds a Mail screen under the AQM menu with a send test.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      A. Q. Mufti
  * License:     GPL-2.0-or-later
  *
@@ -61,7 +61,7 @@
 defined( 'ABSPATH' ) || exit;
 
 define( 'AQM_MD_FILE', __FILE__ );
-define( 'AQM_MD_VERSION', '1.1.0' );
+define( 'AQM_MD_VERSION', '1.2.0' );
 define( 'AQM_MD_GITHUB_REPO', 'AQMufti/aqm-mail-doctor' );
 
 require_once __DIR__ . '/aqm-updater.php';
@@ -391,13 +391,47 @@ function aqm_md_scan( $apply = false ) {
 			if ( ! is_string( $json ) || '' === $json ) {
 				$entry['error'] = 're-encoding failed - nothing written';
 			} else {
-				update_post_meta( $id, '_elementor_data', wp_slash( $json ) );
+
+				/*
+				 * update_post_meta() returns false both when the write fails AND
+				 * when the value is already identical. Version 1.1.0 ignored the
+				 * return value and reported success regardless, which produced
+				 * "Changed 6 of 6" alongside a verify pass that still found all
+				 * six. Never claim a write succeeded without reading it back.
+				 */
+				$written = update_post_meta( $id, '_elementor_data', wp_slash( $json ) );
+
+				// Read back from the database in THIS request, past any object
+				// cache, so the answer cannot be a stale HTTP-cached response.
+				wp_cache_delete( $id, 'post_meta' );
+				$after = (string) get_post_meta( $id, '_elementor_data', true );
+
+				$still  = ( false !== stripos( $after, '@' . AQM_MD_FROM_DOMAIN ) );
+				$recheck = array();
+				$decoded = json_decode( $after, true );
+				if ( is_array( $decoded ) ) {
+					aqm_md_walk( $decoded, $recheck );
+				}
+
+				$entry['write_returned'] = ( false !== $written );
+				$entry['verified']       = empty( $recheck );
+				$entry['applied']        = empty( $recheck );
+
+				if ( ! empty( $recheck ) ) {
+					$entry['error'] = sprintf(
+						'write did not stick - update_post_meta returned %s, and %d form setting(s) still carry the old domain after re-reading',
+						( false !== $written ) ? 'a row id / true' : 'false',
+						count( $recheck )
+					);
+				} elseif ( $still ) {
+					// Form settings are clean; the remaining mention is page copy,
+					// which is deliberately never rewritten.
+					$entry['note'] = 'form settings fixed; the old address still appears in page copy, which is left alone by design';
+				}
 
 				// Elementor caches rendered CSS per post id; both are regenerated.
 				delete_post_meta( $id, '_elementor_css' );
 				delete_post_meta( $id, '_elementor_element_cache' );
-
-				$entry['applied'] = true;
 			}
 		}
 
@@ -424,6 +458,24 @@ function aqm_md_restore( $id ) {
  * REST. One namespace per plugin - see claude/aqm-rest-namespace-standard.md.
  * No aqm/v1 alias: this plugin is new and has no callers to keep working.
  */
+/**
+ * This site sits behind LiteSpeed and QUIC.cloud, and has a documented history
+ * of serving cached REST responses. A scan that reports yesterday's answer is
+ * worse than no scan, so these routes forbid caching explicitly.
+ */
+add_filter(
+	'rest_post_dispatch',
+	function ( $response, $server, $request ) {
+		if ( 0 === strpos( (string) $request->get_route(), '/aqm-maildoctor/v1' ) ) {
+			$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+			$response->header( 'X-LiteSpeed-Cache-Control', 'no-cache' );
+		}
+		return $response;
+	},
+	10,
+	3
+);
+
 add_action(
 	'rest_api_init',
 	function () {
