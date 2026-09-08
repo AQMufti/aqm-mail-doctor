@@ -3,7 +3,7 @@
  * Plugin Name: AQM Mail Doctor
  * Plugin URI:  https://github.com/AQMufti/aqm-mail-doctor
  * Description: Normalises outgoing mail to the aqmuftirealty.com standard, and records what the mail server ACTUALLY said when a message is refused. Adds a Mail screen under the AQM menu with a send test.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      A. Q. Mufti
  * License:     GPL-2.0-or-later
  *
@@ -61,7 +61,7 @@
 defined( 'ABSPATH' ) || exit;
 
 define( 'AQM_MD_FILE', __FILE__ );
-define( 'AQM_MD_VERSION', '1.3.0' );
+define( 'AQM_MD_VERSION', '1.4.0' );
 define( 'AQM_MD_GITHUB_REPO', 'AQMufti/aqm-mail-doctor' );
 
 require_once __DIR__ . '/aqm-updater.php';
@@ -594,6 +594,53 @@ function aqm_md_screen() {
 		}
 	}
 
+	/*
+	 * Fixing the forms from HERE rather than over REST is deliberate.
+	 *
+	 * This site's LiteSpeed/QUIC.cloud configuration caches REST responses AND
+	 * drops the query string from the cache key, so /wp-json/... and
+	 * /?rest_route=... were both served from stale edge objects - different
+	 * nodes returning a months-old 404 and an hours-old 200 for the same url at
+	 * the same moment. Cache-busting cannot work when the buster is discarded.
+	 *
+	 * wp-admin is never cached. Doing the write from this screen removes the
+	 * cache from the problem completely. The REST routes stay for scripting,
+	 * but this button is the reliable path on this site.
+	 */
+	if ( ! empty( $_POST['aqm_md_fix'] ) && check_admin_referer( 'aqm_md_fix' ) ) {
+
+		$done = aqm_md_scan( true );
+
+		$ok   = array_filter( $done, function ( $r ) { return ! empty( $r['applied'] ); } );
+		$bad  = array_filter( $done, function ( $r ) { return ! empty( $r['error'] ); } );
+
+		$lines = array();
+		foreach ( $ok as $r ) {
+			$lines[] = sprintf(
+				'<li>#%d <strong>%s</strong> &mdash; written and read back clean</li>',
+				(int) $r['id'],
+				esc_html( $r['title'] )
+			);
+		}
+		foreach ( $bad as $r ) {
+			$lines[] = sprintf(
+				'<li style="color:#b32d2e">#%d <strong>%s</strong> &mdash; %s</li>',
+				(int) $r['id'],
+				esc_html( $r['title'] ),
+				esc_html( $r['error'] )
+			);
+		}
+
+		$result = sprintf(
+			'<div class="notice notice-%s"><p><strong>%d page(s) written and verified%s.</strong></p><ul style="list-style:disc;margin-left:1.4em">%s</ul>'
+			. '<p>Now purge LiteSpeed <em>and</em> QUIC.cloud &mdash; Elementor\'s cached CSS for these pages was invalidated.</p></div>',
+			$bad ? 'warning' : 'success',
+			count( $ok ),
+			$bad ? sprintf( ', %d failed', count( $bad ) ) : '',
+			implode( '', $lines )
+		);
+	}
+
 	if ( ! empty( $_POST['aqm_md_clear'] ) && check_admin_referer( 'aqm_md_test' ) ) {
 		delete_option( 'aqm_md_log' );
 		$result = '<div class="notice notice-success"><p>Log cleared.</p></div>';
@@ -659,6 +706,18 @@ function aqm_md_screen() {
 			);
 		}
 		echo '</tbody></table>';
+
+		echo '<form method="post" style="margin-top:1em">';
+		wp_nonce_field( 'aqm_md_fix' );
+		printf(
+			'<button class="button button-primary" name="aqm_md_fix" value="1">Repoint %d page(s) to %s</button>',
+			count( $to_change ),
+			esc_html( AQM_MD_TO_DOMAIN )
+		);
+		echo '</form>';
+		echo '<p style="color:#50575e">Only form settings are changed &mdash; <code>email_to</code>, <code>email_from</code>, '
+			. '<code>email_reply_to</code>, <code>email_cc</code>, <code>email_bcc</code> and their numbered variants. Visible page copy is '
+			. 'never touched. Each page\'s original Elementor data is backed up once before its first change.</p>';
 	}
 
 	if ( $copy_only ) {
