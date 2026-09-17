@@ -3,7 +3,7 @@
  * Plugin Name: AQM Mail Doctor
  * Plugin URI:  https://github.com/AQMufti/aqm-mail-doctor
  * Description: Normalises outgoing mail to the aqmuftirealty.com standard, and records what the mail server ACTUALLY said when a message is refused. Adds a Mail screen under the AQM menu with a send test.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      A. Q. Mufti
  * License:     GPL-2.0-or-later
  *
@@ -56,12 +56,24 @@
  * IT DOES NOT TOUCH AQM MAIL TRANSPORT. That file holds the Titan password and
  * stays a must-use plugin - see section 6 of claude/aqm-plugin-standard.md.
  * This hooks at lower and higher priorities around it and leaves it alone.
+ *
+ * 1.5.0 (17 Sep 2026) - TELL A BLOCKED SPAM FROM AN OUTAGE
+ *
+ * The nine "Email is failing" alerts of 8-16 Sep turned out to be Titan refusing to carry spam
+ * that bots had put through the old Elementor contact form: "550 5.7.1 Mail contain spam content".
+ * That is the mail system working. It was recorded and displayed exactly like a broken mail
+ * server, and chasing it cost real time.
+ *
+ * So a 5xx refusal that names spam is now logged as 'spam-blocked' and taken back out of the
+ * transport's failure list, which is what raises the red banner. Replies about the SENDER -
+ * a blocklisted IP, a bad sending reputation, SPF or DKIM - are deliberately NOT treated this
+ * way: those are outages, and the point of this change is that the next real one stands out.
  */
 
 defined( 'ABSPATH' ) || exit;
 
 define( 'AQM_MD_FILE', __FILE__ );
-define( 'AQM_MD_VERSION', '1.4.0' );
+define( 'AQM_MD_VERSION', '1.5.0' );
 define( 'AQM_MD_GITHUB_REPO', 'AQMufti/aqm-mail-doctor' );
 
 require_once __DIR__ . '/aqm-updater.php';
@@ -219,8 +231,10 @@ add_action(
 			}
 		}
 
+		$spam = aqm_md_is_spam_refusal( $reply );
+
 		aqm_md_note(
-			'failed',
+			$spam ? 'spam-blocked' : 'failed',
 			array(
 				'to'           => $to,
 				'wp_error'     => $error->get_error_message(),
@@ -229,9 +243,124 @@ add_action(
 			),
 			( is_array( $data ) && ! empty( $data['subject'] ) ) ? $data['subject'] : ''
 		);
+
+		/* Remember it for the late hook below, which has to run after AQM Mail Transport
+		   has written its own record at priority 10. */
+		$GLOBALS['aqm_md_last_spam'] = $spam ? array( 'to' => $to, 'error' => $error->get_error_message() ) : null;
 	},
 	1
 );
+
+/**
+ * Is this the mail server refusing to carry spam, rather than a delivery failure?
+ *
+ * Titan answers "550 5.7.1 Mail contain spam content <queue id>" when its outbound filter
+ * rejects a message. That is the mail system WORKING - a bot filled in a form and the
+ * notification was stopped on the way out. It is not an outage and must not be counted as one.
+ *
+ * Deliberately narrow: a 5.7.x class reply that says spam, or a handful of wordings other
+ * filters use. Anything else stays a failure, because treating a real outage as routine is
+ * the worse mistake of the two.
+ */
+function aqm_md_is_spam_refusal( $reply ) {
+	$reply = (string) $reply;
+	if ( '' === $reply ) {
+		return false;
+	}
+	if ( ! preg_match( '/\b5\d{2}\b/', $reply ) ) {
+		return false;
+	}
+	/* A reply about the SENDER - a blocklisted IP, a poor sending reputation, a failed SPF or
+	   DKIM check - is an outage, not one blocked message. Those replies usually say "spam" too,
+	   so they are excluded FIRST. Hiding one of those would be the worst thing this can do. */
+	if ( preg_match( '/blocklist|blacklist|\brbl\b|spamhaus|barracuda|spamcop|reputation|\blisted\b|client host|\bhelo\b|\bptr\b|\bspf\b|\bdkim\b|\bdmarc\b/i', $reply ) ) {
+		return false;
+	}
+	return (bool) preg_match( '/\bspam\b|\bbulk mail\b|content rejected|message content rejected|spam(?:my)? content|blocked as spam/i', $reply );
+}
+
+/**
+ * AQM Mail Transport records every wp_mail_failed into aqm_mail_failures at priority 10, and
+ * raises the red "Email is failing" banner from it. It only ever sees PHPMailer's own wording
+ * ("Data not accepted"), so it cannot tell a blocked spam from a broken mail server.
+ *
+ * This runs after it and takes the spam ones back out. Nine blocked spam notifications produced
+ * a red banner that read like an outage and cost real time to chase on 17 Sep 2026; the next
+ * genuine failure has to stand out, and it cannot if the banner is usually wrong.
+ *
+ * The transport file is not touched - it holds the Titan password and stays untouched by design.
+ */
+add_action(
+	'wp_mail_failed',
+	function () {
+
+		$spam = isset( $GLOBALS['aqm_md_last_spam'] ) ? $GLOBALS['aqm_md_last_spam'] : null;
+		$GLOBALS['aqm_md_last_spam'] = null;
+		if ( ! $spam ) {
+			return;
+		}
+
+		$log = get_option( 'aqm_mail_failures', array() );
+		if ( ! is_array( $log ) || ! $log ) {
+			return;
+		}
+		/* Only the newest entry, and only if it is the one just written for this message. */
+		$first = reset( $log );
+		if ( is_array( $first )
+			&& isset( $first['to'], $first['error'] )
+			&& $first['to'] === $spam['to']
+			&& $first['error'] === $spam['error'] ) {
+			array_shift( $log );
+			update_option( 'aqm_mail_failures', $log, false );
+		}
+	},
+	999
+);
+
+/**
+ * One-off tidy on upgrade: take the already-recorded spam refusals out of the transport's list,
+ * matching each against this plugin's own log by timestamp. Genuine failures are left alone.
+ */
+function aqm_md_prune_spam_from_failures() {
+
+	$log = get_option( 'aqm_mail_failures', array() );
+	if ( ! is_array( $log ) || ! $log ) {
+		return 0;
+	}
+	$mine = get_option( 'aqm_md_log', array() );
+	if ( ! is_array( $mine ) ) {
+		$mine = array();
+	}
+	$spam_at = array();
+	foreach ( $mine as $row ) {
+		if ( ! is_array( $row ) || empty( $row['when'] ) ) {
+			continue;
+		}
+		$reply = isset( $row['detail']['server_reply'] ) ? $row['detail']['server_reply'] : '';
+		if ( 'spam-blocked' === ( isset( $row['kind'] ) ? $row['kind'] : '' ) || aqm_md_is_spam_refusal( $reply ) ) {
+			$spam_at[ $row['when'] ] = true;
+		}
+	}
+	if ( ! $spam_at ) {
+		return 0;
+	}
+	$before = count( $log );
+	$log    = array_values( array_filter( $log, function ( $row ) use ( $spam_at ) {
+		return ! ( is_array( $row ) && ! empty( $row['when'] ) && isset( $spam_at[ $row['when'] ] ) );
+	} ) );
+	$gone = $before - count( $log );
+	if ( $gone > 0 ) {
+		update_option( 'aqm_mail_failures', $log, false );
+	}
+	return $gone;
+}
+add_action( 'admin_init', function () {
+	if ( get_option( 'aqm_md_pruned_version' ) === AQM_MD_VERSION ) {
+		return;
+	}
+	aqm_md_prune_spam_from_failures();
+	update_option( 'aqm_md_pruned_version', AQM_MD_VERSION, false );
+} );
 
 /** Append to the log, newest first, capped. */
 function aqm_md_note( $kind, $detail, $subject = '' ) {
